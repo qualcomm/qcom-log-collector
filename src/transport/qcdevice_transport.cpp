@@ -194,15 +194,22 @@ size_t QcDeviceTransport::write(const uint8_t* data, size_t len) {
                   + hex_dump(data, len) + "]");
     }
 
-    // Matches TUF Usb::sendSync() — retry loop with QcDevice::SendToDevice
+    // Matches TUF Usb::sendSync() — retry loop with QcDevice::SendToDevice.
+    //
+    // Every exit from this loop is decided here, not by the loop condition: a
+    // failed SendToDevice must stay retryable, so `send_ok` deliberately does
+    // NOT gate the next iteration (it used to, which made MAX_SEND_RETRY
+    // unreachable for anything but a partial-then-failing write).
     DWORD total_sent = 0;
     int attempts = 0;
-    bool send_ok = true;
+    // Linear backoff step per retry. Local to write() so this fix touches only
+    // this translation unit.
+    constexpr int kSendRetryDelayMs = 5;
 
-    while (send_ok && total_sent < static_cast<DWORD>(len)) {
+    while (total_sent < static_cast<DWORD>(len)) {
         DWORD bytes_sent = 0;
 
-        send_ok = !!QcDevice::SendToDevice(
+        const bool send_ok = !!QcDevice::SendToDevice(
             handle_,
             const_cast<uint8_t*>(data + total_sent),
             static_cast<DWORD>(len - total_sent),
@@ -215,18 +222,38 @@ size_t QcDeviceTransport::write(const uint8_t* data, size_t len) {
                 FLOG_DEBUG("QcDevice: SendToDevice OK (sent=" + std::to_string(bytes_sent)
                           + " total=" + std::to_string(total_sent) + "/" + std::to_string(len) + ")");
             }
-        } else {
-            ++attempts;
-            CFLOG_ERROR("QcDevice: SendToDevice failed (status=" + std::to_string(send_ok)
-                      + " bytes=" + std::to_string(bytes_sent)
-                      + " attempt=" + std::to_string(attempts)
-                      + " total=" + std::to_string(total_sent) + "/" + std::to_string(len) + ")", true);
-
-            if ((bytes_sent == 0 && total_sent == 0) ||
-                attempts > MAX_SEND_RETRY) {
-                break;
-            }
+            continue;
         }
+
+        // No forward progress this attempt. On Linux, QTI_ASYNC_IO is never
+        // defined, so QcDevice::SendToDevice is a bare write(2) on a port
+        // opened O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK (qds_lnx/libLNX/
+        // qcdev.cpp). A full tty write buffer therefore returns -1/EAGAIN,
+        // which that layer flattens to "0 bytes sent, FALSE" — indistinguish-
+        // able here from a hard error such as EIO. Retry either way: EAGAIN
+        // clears as soon as the buffer drains, and a bounded retry costs at
+        // most a few tens of ms on a genuinely dead port. Not retrying costs a
+        // silently dropped DIAG command — the caller only logs "Incomplete
+        // write" and then waits out a response that can never arrive.
+        ++attempts;
+        const std::string ctx = "(status=" + std::to_string(send_ok)
+                              + " bytes=" + std::to_string(bytes_sent)
+                              + " attempt=" + std::to_string(attempts) + "/"
+                              + std::to_string(MAX_SEND_RETRY)
+                              + " total=" + std::to_string(total_sent) + "/"
+                              + std::to_string(len) + ")";
+
+        if (attempts > MAX_SEND_RETRY) {
+            CFLOG_ERROR("QcDevice: SendToDevice failed, retries exhausted " + ctx, true);
+            break;
+        }
+
+        // Linear backoff: a tty buffer that is full right now is usually
+        // drained within a few ms, so start short rather than burning the
+        // whole retry budget in a tight spin.
+        CFLOG_WARNING("QcDevice: SendToDevice made no progress, retrying " + ctx, true);
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kSendRetryDelayMs * attempts));
     }
 
     return static_cast<size_t>(total_sent);
